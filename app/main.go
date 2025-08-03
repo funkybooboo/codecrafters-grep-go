@@ -87,7 +87,20 @@ func matchLine(line []byte, pattern string) (bool, error) {
 		return false, nil
 	}
 
-	// Default: only allow a single literal character
+	// Handle positive character group like [abc]
+	if strings.HasPrefix(pattern, "[") && strings.HasSuffix(pattern, "]") {
+		log("matchLine", "debug", "Pattern is a character group")
+		if len(pattern) <= 2 {
+			return false, fmt.Errorf("empty character group: %q", pattern)
+		}
+		charGroup := pattern[1 : len(pattern)-1] // remove brackets
+		log("matchLine", "debug", fmt.Sprintf("Character group contents: %q", charGroup))
+		ok := bytes.ContainsAny(line, charGroup)
+		log("matchLine", "debug", fmt.Sprintf("Group match result: %v", ok))
+		return ok, nil
+	}
+
+	// Default: literal character match (single rune)
 	if utf8.RuneCountInString(pattern) != 1 {
 		return false, fmt.Errorf("unsupported pattern: %q", pattern)
 	}
