@@ -101,6 +101,7 @@ func unescapePattern(p string) string {
 func tokenizePattern(pat string) ([]token, error) {
 	var tokens []token
 	i := 0
+
 	for i < len(pat) {
 		var tok token
 
@@ -141,13 +142,18 @@ func tokenizePattern(pat string) ([]token, error) {
 			i += size
 		}
 
-		if i < len(pat) && pat[i] == '+' {
-			tok.quantifier = "+"
-			i++
+		// If the next char is a quantifier, attach it to this token
+		if i < len(pat) {
+			switch pat[i] {
+			case '+', '?':
+				tok.quantifier = string(pat[i])
+				i++
+			}
 		}
 
 		tokens = append(tokens, tok)
 	}
+
 	return tokens, nil
 }
 
@@ -180,13 +186,22 @@ func matchTokens(input []byte, tokens []token, anchoredStart, anchoredEnd bool) 
 				}
 			}
 
-			if tok.quantifier == "+" && count == 0 {
-				match = false
-				break
-			}
-			if tok.quantifier == "" && count != 1 {
-				match = false
-				break
+			switch tok.quantifier {
+			case "+":
+				if count == 0 {
+					match = false
+					break
+				}
+			case "?":
+				if count > 1 {
+					match = false
+					break
+				}
+			case "":
+				if count != 1 {
+					match = false
+					break
+				}
 			}
 
 			if tok.quantifier == "+" && tokIdx+1 < len(tokens) {
@@ -231,11 +246,19 @@ func matchTokensFrom(inputRunes []rune, pos int, tokens []token, anchoredEnd boo
 			}
 		}
 
-		if tok.quantifier == "+" && count == 0 {
-			return false
-		}
-		if tok.quantifier == "" && count != 1 {
-			return false
+		switch tok.quantifier {
+		case "+":
+			if count == 0 {
+				return false
+			}
+		case "?":
+			if count > 1 {
+				return false
+			}
+		case "":
+			if count != 1 {
+				return false
+			}
 		}
 
 		if tok.quantifier == "+" && tokIdx+1 < len(tokens) {
