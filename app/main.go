@@ -64,9 +64,15 @@ func parseArgs(args []string) (string, error) {
 func matchLine(line []byte, pattern string) (bool, error) {
 	log("matchLine", "debug", fmt.Sprintf("Raw pattern: %q", pattern))
 
-	// Fix escaping of backslashes
 	pattern = unescapePattern(pattern)
 	log("matchLine", "debug", fmt.Sprintf("Unescaped pattern: %q", pattern))
+
+	anchored := false
+	if strings.HasPrefix(pattern, "^") {
+		anchored = true
+		pattern = pattern[1:] // strip the ^
+		log("matchLine", "debug", "Detected start anchor ^")
+	}
 
 	tokens, err := tokenizePattern(pattern)
 	if err != nil {
@@ -74,7 +80,7 @@ func matchLine(line []byte, pattern string) (bool, error) {
 	}
 	log("matchLine", "debug", fmt.Sprintf("Tokenized into %d tokens", len(tokens)))
 
-	ok := matchTokens(line, tokens)
+	ok := matchTokens(line, tokens, anchored)
 	log("matchLine", "debug", fmt.Sprintf("Final match result: %v", ok))
 	return ok, nil
 }
@@ -128,9 +134,22 @@ func tokenizePattern(pat string) ([]token, error) {
 	return tokens, nil
 }
 
-func matchTokens(input []byte, tokens []token) bool {
+func matchTokens(input []byte, tokens []token, anchored bool) bool {
 	inputRunes := []rune(string(input))
-	for i := 0; i <= len(inputRunes)-len(tokens); i++ {
+
+	startIndexes := []int{0}
+	if !anchored {
+		startIndexes = make([]int, len(inputRunes)-len(tokens)+1)
+		for i := range startIndexes {
+			startIndexes[i] = i
+		}
+	}
+
+	for _, i := range startIndexes {
+		if i+len(tokens) > len(inputRunes) {
+			continue
+		}
+
 		match := true
 		for j, tok := range tokens {
 			c := inputRunes[i+j]
@@ -165,6 +184,7 @@ func matchTokens(input []byte, tokens []token) bool {
 				break
 			}
 		}
+
 		if match {
 			return true
 		}
