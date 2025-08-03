@@ -67,11 +67,19 @@ func matchLine(line []byte, pattern string) (bool, error) {
 	pattern = unescapePattern(pattern)
 	log("matchLine", "debug", fmt.Sprintf("Unescaped pattern: %q", pattern))
 
-	anchored := false
+	anchoredStart := false
+	anchoredEnd := false
+
 	if strings.HasPrefix(pattern, "^") {
-		anchored = true
-		pattern = pattern[1:] // strip the ^
+		anchoredStart = true
+		pattern = pattern[1:]
 		log("matchLine", "debug", "Detected start anchor ^")
+	}
+
+	if strings.HasSuffix(pattern, "$") {
+		anchoredEnd = true
+		pattern = pattern[:len(pattern)-1]
+		log("matchLine", "debug", "Detected end anchor $")
 	}
 
 	tokens, err := tokenizePattern(pattern)
@@ -80,7 +88,7 @@ func matchLine(line []byte, pattern string) (bool, error) {
 	}
 	log("matchLine", "debug", fmt.Sprintf("Tokenized into %d tokens", len(tokens)))
 
-	ok := matchTokens(line, tokens, anchored)
+	ok := matchTokens(line, tokens, anchoredStart, anchoredEnd)
 	log("matchLine", "debug", fmt.Sprintf("Final match result: %v", ok))
 	return ok, nil
 }
@@ -134,12 +142,16 @@ func tokenizePattern(pat string) ([]token, error) {
 	return tokens, nil
 }
 
-func matchTokens(input []byte, tokens []token, anchored bool) bool {
+func matchTokens(input []byte, tokens []token, anchoredStart, anchoredEnd bool) bool {
 	inputRunes := []rune(string(input))
+	maxStart := len(inputRunes) - len(tokens)
+	if maxStart < 0 {
+		return false
+	}
 
 	startIndexes := []int{0}
-	if !anchored {
-		startIndexes = make([]int, len(inputRunes)-len(tokens)+1)
+	if !anchoredStart {
+		startIndexes = make([]int, maxStart+1)
 		for i := range startIndexes {
 			startIndexes[i] = i
 		}
@@ -147,6 +159,10 @@ func matchTokens(input []byte, tokens []token, anchored bool) bool {
 
 	for _, i := range startIndexes {
 		if i+len(tokens) > len(inputRunes) {
+			continue
+		}
+
+		if anchoredEnd && i+len(tokens) != len(inputRunes) {
 			continue
 		}
 
