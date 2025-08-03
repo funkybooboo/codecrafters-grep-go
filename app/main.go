@@ -27,56 +27,74 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Determine input source: either a file or stdin
-	var reader io.Reader
-	if len(os.Args) > 3 {
-		filename := os.Args[3]
-		file, err := os.Open(filename)
-		if err != nil {
-			log("main", "error", fmt.Sprintf("Failed to open file %q: %v", filename, err))
-			os.Exit(2)
+	// Determine file list (args[3:] if any)
+	files := os.Args[3:]
+	multi := len(files) > 1
+
+	foundAny := false
+
+	// If no files given, read from stdin without prefix
+	if len(files) == 0 {
+		if scanAndPrint("<stdin>", os.Stdin, pattern, false) {
+			foundAny = true
 		}
-		defer file.Close()
-		reader = file
-		log("main", "debug", fmt.Sprintf("Reading from file: %s", filename))
 	} else {
-		reader = os.Stdin
-		log("main", "debug", "Reading from stdin")
+		// Iterate each file
+		for _, filename := range files {
+			f, err := os.Open(filename)
+			if err != nil {
+				log("main", "error", fmt.Sprintf("Failed to open file %q: %v", filename, err))
+				os.Exit(2)
+			}
+			defer f.Close()
+			if scanAndPrint(filename, f, pattern, multi) {
+				foundAny = true
+			}
+		}
 	}
 
-	// Scan line by line
+	// Exit 0 if any matches, else 1
+	if foundAny {
+		os.Exit(0)
+	}
+	os.Exit(1)
+}
+
+// scanAndPrint reads from reader line by line, applies the pattern,
+// prints matching lines (with optional filename prefix), and
+// returns true if any lines matched.
+func scanAndPrint(prefix string, reader io.Reader, pattern string, addPrefix bool) bool {
 	scanner := bufio.NewScanner(reader)
 	found := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		log("main", "debug", fmt.Sprintf("Scanning line: %q", line))
+		log("scanAndPrint", "debug", fmt.Sprintf("Scanning line: %q", line))
 		ok, err := matchLine([]byte(line), pattern)
 		if err != nil {
-			log("main", "error", fmt.Sprintf("Match error: %v", err))
+			log("scanAndPrint", "error", fmt.Sprintf("Match error: %v", err))
 			os.Exit(2)
 		}
 		if ok {
-			fmt.Println(line)
+			if addPrefix {
+				fmt.Printf("%s:%s\n", prefix, line)
+			} else {
+				fmt.Println(line)
+			}
 			found = true
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		log("main", "error", fmt.Sprintf("Error reading input: %v", err))
+		log("scanAndPrint", "error", fmt.Sprintf("Error reading %s: %v", prefix, err))
 		os.Exit(2)
 	}
-
-	// Exit 0 if any lines matched, else 1
-	if found {
-		os.Exit(0)
-	}
-	os.Exit(1)
+	return found
 }
 
 // parseArgs validates and returns the -E pattern.
 func parseArgs(args []string) (string, error) {
 	log("parseArgs", "debug", "Parsing arguments...")
 	if len(args) < 3 || args[1] != "-E" {
-		return "", fmt.Errorf("usage: mygrep -E <pattern> [file]")
+		return "", fmt.Errorf("usage: mygrep -E <pattern> [file1 file2 ...]")
 	}
 	log("parseArgs", "debug", fmt.Sprintf("Pattern received: %q", args[2]))
 	return args[2], nil
@@ -332,13 +350,11 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 			return []matchRes{{pos + 1, caps}}
 		}
 		return nil
-
 	case *digitNode:
 		if pos < len(runes) && runes[pos] >= '0' && runes[pos] <= '9' {
 			return []matchRes{{pos + 1, caps}}
 		}
 		return nil
-
 	case *wordNode:
 		if pos < len(runes) {
 			c := runes[pos]
@@ -350,13 +366,11 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 			}
 		}
 		return nil
-
 	case *anyNode:
 		if pos < len(runes) {
 			return []matchRes{{pos + 1, caps}}
 		}
 		return nil
-
 	case *charClassNode:
 		if pos < len(runes) {
 			_, in := x.set[runes[pos]]
@@ -365,7 +379,6 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 			}
 		}
 		return nil
-
 	case *sequenceNode:
 		results := []matchRes{{pos, caps}}
 		for _, child := range x.children {
@@ -379,32 +392,26 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 			}
 		}
 		return results
-
 	case *altNode:
 		var all []matchRes
 		for _, alt := range x.alternatives {
 			all = append(all, matchNode(alt, runes, pos, caps)...)
 		}
 		return uniqueRes(all)
-
 	case *repNode:
 		return matchRep(x, runes, pos, caps, 0)
-
 	case *captureNode:
 		sub := matchNode(x.child, runes, pos, caps)
 		var out []matchRes
 		for _, r := range sub {
-			// copy the caps map
 			newCaps := make(map[int][]rune, len(r.caps))
 			for k, v := range r.caps {
 				newCaps[k] = v
 			}
-			// record this group’s substring
 			newCaps[x.index] = append([]rune{}, runes[pos:r.pos]...)
 			out = append(out, matchRes{r.pos, newCaps})
 		}
 		return uniqueRes(out)
-
 	case *backRefNode:
 		group, ok := caps[x.index]
 		if !ok {
@@ -419,7 +426,6 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 			}
 		}
 		return []matchRes{{pos + len(group), caps}}
-
 	default:
 		return nil
 	}
@@ -427,31 +433,26 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 
 func matchRep(r *repNode, runes []rune, pos int, caps map[int][]rune, count int) []matchRes {
 	var results []matchRes
-	// can stop if we've met the minimum
 	if count >= r.min {
 		results = append(results, matchRes{pos, caps})
 	}
-	// stop if max reached
 	if r.max >= 0 && count == r.max {
 		return uniqueRes(results)
 	}
-	// try one more
 	next := matchNode(r.child, runes, pos, caps)
 	for _, nr := range next {
 		if nr.pos == pos {
-			continue // avoid infinite loops
+			continue
 		}
 		results = append(results, matchRep(r, runes, nr.pos, nr.caps, count+1)...)
 	}
 	return uniqueRes(results)
 }
 
-// uniqueRes deduplicates by (pos,caps) signature.
 func uniqueRes(xs []matchRes) []matchRes {
 	seen := make(map[string]bool)
 	var out []matchRes
 	for _, x := range xs {
-		// build a signature: pos + sorted caps
 		keys := make([]int, 0, len(x.caps))
 		for k := range x.caps {
 			keys = append(keys, k)
