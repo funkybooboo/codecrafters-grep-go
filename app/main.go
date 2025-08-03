@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 )
 
 var logMode = "debug" // Change to "info" or higher to reduce verbosity
-
 var logLevels = map[string]int{
 	"debug": 0,
 	"info":  1,
@@ -54,19 +54,20 @@ func parseArgs(args []string) (string, error) {
 	return args[2], nil
 }
 
-// unescapePattern turns literal "\\d" → "\d", "\\w" → "\w", "\\1" stays as "\1".
+// unescapePattern turns "\\d" → "\d", "\\w" → "\w", "\\1" → "\1", etc.
 func unescapePattern(p string) string {
 	return strings.ReplaceAll(p, `\\`, `\`)
 }
 
-// matchLine applies anchors, parses into an AST (with one capture group),
-// and backtracks to match, supporting \1 backreference to that group.
+// matchLine applies anchors, parses into an AST with multiple capture groups/backrefs,
+// and backtracks to see if the input matches.
 func matchLine(input []byte, pattern string) (bool, error) {
 	log("matchLine", "debug", fmt.Sprintf("Raw pattern: %q", pattern))
+
 	pattern = unescapePattern(pattern)
 	log("matchLine", "debug", fmt.Sprintf("Unescaped pattern: %q", pattern))
 
-	// handle anchors
+	// handle ^ and $ anchors
 	anchoredStart := false
 	anchoredEnd := false
 	if strings.HasPrefix(pattern, "^") {
@@ -80,7 +81,7 @@ func matchLine(input []byte, pattern string) (bool, error) {
 		log("matchLine", "debug", "Detected end anchor $")
 	}
 
-	// parse pattern into AST
+	// parse into AST (with capture group numbering)
 	p := newParser(pattern)
 	root, err := p.parse()
 	if err != nil {
@@ -93,25 +94,26 @@ func matchLine(input []byte, pattern string) (bool, error) {
 	// convert input to runes
 	runes := []rune(string(input))
 
-	// matching
-	if anchoredStart {
-		res := matchNode(root, runes, 0, nil)
-		for _, r := range res {
-			if !anchoredEnd || r.pos == len(runes) {
-				log("matchLine", "debug", fmt.Sprintf("Matched at [0:%d]", r.pos))
-				return true, nil
-			}
-		}
-		return false, nil
-	}
+	// initial empty caps map
+	emptyCaps := make(map[int][]rune)
 
-	for start := 0; start <= len(runes); start++ {
-		res := matchNode(root, runes, start, nil)
+	tryMatch := func(start int) bool {
+		res := matchNode(root, runes, start, emptyCaps)
 		for _, r := range res {
 			if !anchoredEnd || r.pos == len(runes) {
 				log("matchLine", "debug", fmt.Sprintf("Matched at [%d:%d]", start, r.pos))
-				return true, nil
+				return true
 			}
+		}
+		return false
+	}
+
+	if anchoredStart {
+		return tryMatch(0), nil
+	}
+	for i := 0; i <= len(runes); i++ {
+		if tryMatch(i) {
+			return true, nil
 		}
 	}
 	return false, nil
@@ -135,14 +137,18 @@ type repNode struct {
 	child    node
 	min, max int // max<0 means “infinite”
 }
-type captureNode struct{ child node }
+type captureNode struct {
+	index int
+	child node
+}
 type backRefNode struct{ index int }
 
 //─── Parser ───────────────────────────────────────────────────────────────────
 
 type parser struct {
-	pattern []rune
-	pos     int
+	pattern    []rune
+	pos        int
+	groupCount int
 }
 
 func newParser(p string) *parser {
@@ -221,6 +227,8 @@ func (p *parser) parseAtom() (node, error) {
 	switch ch {
 	case '(':
 		p.pos++
+		p.groupCount++
+		idx := p.groupCount
 		sub, err := p.parseAlternation()
 		if err != nil {
 			return nil, err
@@ -229,7 +237,7 @@ func (p *parser) parseAtom() (node, error) {
 			return nil, fmt.Errorf("unterminated group")
 		}
 		p.pos++
-		return &captureNode{child: sub}, nil
+		return &captureNode{index: idx, child: sub}, nil
 
 	case '.':
 		p.pos++
@@ -241,14 +249,21 @@ func (p *parser) parseAtom() (node, error) {
 			return nil, fmt.Errorf("dangling escape")
 		}
 		esc := p.pattern[p.pos]
+		// backrefs may be multiple digits
+		if esc >= '1' && esc <= '9' {
+			num := 0
+			for p.pos < len(p.pattern) && p.pattern[p.pos] >= '0' && p.pattern[p.pos] <= '9' {
+				num = num*10 + int(p.pattern[p.pos]-'0')
+				p.pos++
+			}
+			return &backRefNode{index: num}, nil
+		}
 		p.pos++
 		switch esc {
 		case 'd':
 			return &digitNode{}, nil
 		case 'w':
 			return &wordNode{}, nil
-		case '1':
-			return &backRefNode{index: 1}, nil
 		default:
 			return nil, fmt.Errorf("unsupported escape: \\%c", esc)
 		}
@@ -280,21 +295,21 @@ func (p *parser) parseAtom() (node, error) {
 //─── Matcher ───────────────────────────────────────────────────────────────────
 
 type matchRes struct {
-	pos int
-	cap []rune
+	pos  int
+	caps map[int][]rune
 }
 
-func matchNode(n node, runes []rune, pos int, cap []rune) []matchRes {
+func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 	switch x := n.(type) {
 	case *literalNode:
 		if pos < len(runes) && runes[pos] == x.char {
-			return []matchRes{{pos + 1, cap}}
+			return []matchRes{{pos + 1, caps}}
 		}
 		return nil
 
 	case *digitNode:
 		if pos < len(runes) && runes[pos] >= '0' && runes[pos] <= '9' {
-			return []matchRes{{pos + 1, cap}}
+			return []matchRes{{pos + 1, caps}}
 		}
 		return nil
 
@@ -305,14 +320,14 @@ func matchNode(n node, runes []rune, pos int, cap []rune) []matchRes {
 				(c >= 'A' && c <= 'Z') ||
 				(c >= '0' && c <= '9') ||
 				c == '_' {
-				return []matchRes{{pos + 1, cap}}
+				return []matchRes{{pos + 1, caps}}
 			}
 		}
 		return nil
 
 	case *anyNode:
 		if pos < len(runes) {
-			return []matchRes{{pos + 1, cap}}
+			return []matchRes{{pos + 1, caps}}
 		}
 		return nil
 
@@ -321,22 +336,22 @@ func matchNode(n node, runes []rune, pos int, cap []rune) []matchRes {
 			_, in := x.set[runes[pos]]
 			if x.negated {
 				if !in {
-					return []matchRes{{pos + 1, cap}}
+					return []matchRes{{pos + 1, caps}}
 				}
 			} else {
 				if in {
-					return []matchRes{{pos + 1, cap}}
+					return []matchRes{{pos + 1, caps}}
 				}
 			}
 		}
 		return nil
 
 	case *sequenceNode:
-		results := []matchRes{{pos, cap}}
+		results := []matchRes{{pos, caps}}
 		for _, child := range x.children {
 			var next []matchRes
 			for _, r := range results {
-				next = append(next, matchNode(child, runes, r.pos, r.cap)...)
+				next = append(next, matchNode(child, runes, r.pos, r.caps)...)
 			}
 			results = uniqueRes(next)
 			if len(results) == 0 {
@@ -348,80 +363,86 @@ func matchNode(n node, runes []rune, pos int, cap []rune) []matchRes {
 	case *altNode:
 		var all []matchRes
 		for _, alt := range x.alternatives {
-			all = append(all, matchNode(alt, runes, pos, cap)...)
+			all = append(all, matchNode(alt, runes, pos, caps)...)
 		}
 		return uniqueRes(all)
 
 	case *repNode:
-		return matchRep(x, runes, pos, cap, 0)
+		return matchRep(x, runes, pos, caps, 0)
 
 	case *captureNode:
-		// first match the child, then record its substring as cap
-		subResults := matchNode(x.child, runes, pos, cap)
+		subResults := matchNode(x.child, runes, pos, caps)
 		var out []matchRes
 		for _, r := range subResults {
-			// capture the runes from pos to r.pos
-			newCap := make([]rune, r.pos-pos)
-			copy(newCap, runes[pos:r.pos])
-			out = append(out, matchRes{r.pos, newCap})
+			// copy parent caps map
+			newCaps := make(map[int][]rune, len(r.caps))
+			for k, v := range r.caps {
+				newCaps[k] = v
+			}
+			// record this group's text
+			newCaps[x.index] = append([]rune{}, runes[pos:r.pos]...)
+			out = append(out, matchRes{r.pos, newCaps})
 		}
 		return uniqueRes(out)
 
 	case *backRefNode:
-		// only support \1 and single capture group
-		if x.index != 1 || cap == nil {
+		group, ok := caps[x.index]
+		if !ok {
 			return nil
 		}
-		// check that runes at pos match cap
-		if pos+len(cap) > len(runes) {
+		if pos+len(group) > len(runes) {
 			return nil
 		}
-		for i, cr := range cap {
+		for i, cr := range group {
 			if runes[pos+i] != cr {
 				return nil
 			}
 		}
-		return []matchRes{{pos + len(cap), cap}}
+		return []matchRes{{pos + len(group), caps}}
 
 	default:
 		return nil
 	}
 }
 
-func matchRep(r *repNode, runes []rune, pos int, cap []rune, count int) []matchRes {
+func matchRep(r *repNode, runes []rune, pos int, caps map[int][]rune, count int) []matchRes {
 	var results []matchRes
-	// if we've satisfied the minimum, we can stop here
+	// can stop if we've met the minimum
 	if count >= r.min {
-		results = append(results, matchRes{pos, cap})
+		results = append(results, matchRes{pos, caps})
 	}
-	// if we've hit the maximum (and max>=0), stop
+	// stop if max reached
 	if r.max >= 0 && count == r.max {
 		return uniqueRes(results)
 	}
-	// try one more repetition
-	next := matchNode(r.child, runes, pos, cap)
+	// try one more
+	next := matchNode(r.child, runes, pos, caps)
 	for _, nr := range next {
 		if nr.pos == pos {
-			// avoid infinite loops on zero-length matches
-			continue
+			continue // avoid infinite loops
 		}
-		results = append(results, matchRep(r, runes, nr.pos, nr.cap, count+1)...)
+		results = append(results, matchRep(r, runes, nr.pos, nr.caps, count+1)...)
 	}
 	return uniqueRes(results)
 }
 
-// uniqueRes removes duplicate (pos, cap) pairs.
+// uniqueRes deduplicates by (pos,caps) signature.
 func uniqueRes(xs []matchRes) []matchRes {
-	seen := make(map[int]map[string]bool)
+	seen := make(map[string]bool)
 	var out []matchRes
 	for _, x := range xs {
-		// use position and stringified cap as a key
-		key := string(x.cap)
-		if seen[x.pos] == nil {
-			seen[x.pos] = make(map[string]bool)
+		// build a signature: pos + sorted caps
+		keys := make([]int, 0, len(x.caps))
+		for k := range x.caps {
+			keys = append(keys, k)
 		}
-		if !seen[x.pos][key] {
-			seen[x.pos][key] = true
+		sort.Ints(keys)
+		sig := fmt.Sprintf("%d:", x.pos)
+		for _, k := range keys {
+			sig += fmt.Sprintf("%d=%s|", k, string(x.caps[k]))
+		}
+		if !seen[sig] {
+			seen[sig] = true
 			out = append(out, x)
 		}
 	}
