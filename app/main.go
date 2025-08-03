@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -19,55 +20,82 @@ var logLevels = map[string]int{
 func main() {
 	log("main", "debug", "Starting program...")
 
+	// Parse the -E pattern
 	pattern, err := parseArgs(os.Args)
 	if err != nil {
 		log("main", "error", fmt.Sprintf("Argument parsing failed: %v", err))
 		os.Exit(2)
 	}
 
-	line, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		log("main", "error", fmt.Sprintf("Failed to read stdin: %v", err))
-		os.Exit(2)
+	// Determine input source: either a file or stdin
+	var reader io.Reader
+	if len(os.Args) > 3 {
+		filename := os.Args[3]
+		file, err := os.Open(filename)
+		if err != nil {
+			log("main", "error", fmt.Sprintf("Failed to open file %q: %v", filename, err))
+			os.Exit(2)
+		}
+		defer file.Close()
+		reader = file
+		log("main", "debug", fmt.Sprintf("Reading from file: %s", filename))
+	} else {
+		reader = os.Stdin
+		log("main", "debug", "Reading from stdin")
 	}
-	log("main", "debug", fmt.Sprintf("Read input: %q", line))
 
-	ok, err := matchLine(line, pattern)
-	if err != nil {
-		log("main", "error", fmt.Sprintf("Match error: %v", err))
+	// Scan line by line
+	scanner := bufio.NewScanner(reader)
+	found := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		log("main", "debug", fmt.Sprintf("Scanning line: %q", line))
+		ok, err := matchLine([]byte(line), pattern)
+		if err != nil {
+			log("main", "error", fmt.Sprintf("Match error: %v", err))
+			os.Exit(2)
+		}
+		if ok {
+			fmt.Println(line)
+			found = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log("main", "error", fmt.Sprintf("Error reading input: %v", err))
 		os.Exit(2)
 	}
-	if !ok {
-		log("main", "info", "Pattern not matched, exiting with code 1")
-		os.Exit(1)
+
+	// Exit 0 if any lines matched, else 1
+	if found {
+		os.Exit(0)
 	}
-	log("main", "info", "Pattern matched, exiting with code 0")
+	os.Exit(1)
 }
 
 // parseArgs validates and returns the -E pattern.
 func parseArgs(args []string) (string, error) {
 	log("parseArgs", "debug", "Parsing arguments...")
 	if len(args) < 3 || args[1] != "-E" {
-		return "", fmt.Errorf("usage: mygrep -E <pattern>")
+		return "", fmt.Errorf("usage: mygrep -E <pattern> [file]")
 	}
 	log("parseArgs", "debug", fmt.Sprintf("Pattern received: %q", args[2]))
 	return args[2], nil
 }
 
-// unescapePattern turns "\\d" → "\d", "\\w" → "\w", "\\1" → "\1", etc.
+// unescapePattern turns literal "\\d", "\\w", "\\1", etc. into "\d", "\w", "\1".
 func unescapePattern(p string) string {
 	return strings.ReplaceAll(p, `\\`, `\`)
 }
 
-// matchLine applies anchors, parses into an AST with multiple capture groups/backrefs,
-// and backtracks to see if the input matches.
+// matchLine applies ^/$ anchors, parses into an AST with nested capture‐groups/backrefs,
+// then backtracks to see if the input matches.
 func matchLine(input []byte, pattern string) (bool, error) {
 	log("matchLine", "debug", fmt.Sprintf("Raw pattern: %q", pattern))
 
 	pattern = unescapePattern(pattern)
 	log("matchLine", "debug", fmt.Sprintf("Unescaped pattern: %q", pattern))
 
-	// handle ^ and $ anchors
+	// handle anchors
 	anchoredStart := false
 	anchoredEnd := false
 	if strings.HasPrefix(pattern, "^") {
@@ -81,25 +109,23 @@ func matchLine(input []byte, pattern string) (bool, error) {
 		log("matchLine", "debug", "Detected end anchor $")
 	}
 
-	// parse into AST (with capture group numbering)
+	// parse into AST (with nested capture numbering)
 	p := newParser(pattern)
 	root, err := p.parse()
 	if err != nil {
 		return false, err
 	}
 	if p.pos < len(p.pattern) {
-		return false, fmt.Errorf("unexpected char at position %d", p.pos)
+		return false, fmt.Errorf("unexpected character at position %d", p.pos)
 	}
 
 	// convert input to runes
 	runes := []rune(string(input))
-
-	// initial empty caps map
 	emptyCaps := make(map[int][]rune)
 
-	tryMatch := func(start int) bool {
-		res := matchNode(root, runes, start, emptyCaps)
-		for _, r := range res {
+	tryAt := func(start int) bool {
+		results := matchNode(root, runes, start, emptyCaps)
+		for _, r := range results {
 			if !anchoredEnd || r.pos == len(runes) {
 				log("matchLine", "debug", fmt.Sprintf("Matched at [%d:%d]", start, r.pos))
 				return true
@@ -109,10 +135,10 @@ func matchLine(input []byte, pattern string) (bool, error) {
 	}
 
 	if anchoredStart {
-		return tryMatch(0), nil
+		return tryAt(0), nil
 	}
 	for i := 0; i <= len(runes); i++ {
-		if tryMatch(i) {
+		if tryAt(i) {
 			return true, nil
 		}
 	}
@@ -334,14 +360,8 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 	case *charClassNode:
 		if pos < len(runes) {
 			_, in := x.set[runes[pos]]
-			if x.negated {
-				if !in {
-					return []matchRes{{pos + 1, caps}}
-				}
-			} else {
-				if in {
-					return []matchRes{{pos + 1, caps}}
-				}
+			if (x.negated && !in) || (!x.negated && in) {
+				return []matchRes{{pos + 1, caps}}
 			}
 		}
 		return nil
@@ -371,15 +391,15 @@ func matchNode(n node, runes []rune, pos int, caps map[int][]rune) []matchRes {
 		return matchRep(x, runes, pos, caps, 0)
 
 	case *captureNode:
-		subResults := matchNode(x.child, runes, pos, caps)
+		sub := matchNode(x.child, runes, pos, caps)
 		var out []matchRes
-		for _, r := range subResults {
-			// copy parent caps map
+		for _, r := range sub {
+			// copy the caps map
 			newCaps := make(map[int][]rune, len(r.caps))
 			for k, v := range r.caps {
 				newCaps[k] = v
 			}
-			// record this group's text
+			// record this group’s substring
 			newCaps[x.index] = append([]rune{}, runes[pos:r.pos]...)
 			out = append(out, matchRes{r.pos, newCaps})
 		}
@@ -449,10 +469,10 @@ func uniqueRes(xs []matchRes) []matchRes {
 	return out
 }
 
-// log prints to stderr according to the current logMode
+// log prints to stderr according to the current logMode.
 func log(funcName, level, message string) {
 	if logLevels[level] >= logLevels[logMode] {
-		_, _ = fmt.Fprintf(os.Stderr, "[%s] [%s] %s\n",
+		fmt.Fprintf(os.Stderr, "[%s] [%s] %s\n",
 			funcName, strings.ToUpper(level), message)
 	}
 }
