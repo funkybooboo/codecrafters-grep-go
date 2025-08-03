@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +15,11 @@ var logLevels = map[string]int{
 	"info":  1,
 	"warn":  2,
 	"error": 3,
+}
+
+type token struct {
+	kind  string // "literal", "digit", "word", "group", "negated_group"
+	value string
 }
 
 func main() {
@@ -58,76 +62,114 @@ func parseArgs(args []string) (string, error) {
 }
 
 func matchLine(line []byte, pattern string) (bool, error) {
-	log("matchLine", "debug", fmt.Sprintf("Matching pattern: %q", pattern))
+	log("matchLine", "debug", fmt.Sprintf("Raw pattern: %q", pattern))
 
-	switch pattern {
-	case `\d`:
-		log("matchLine", "debug", "Pattern is \\d — matching any digit")
-		for _, b := range line {
-			if b >= '0' && b <= '9' {
-				log("matchLine", "debug", fmt.Sprintf("Found digit: %q", b))
-				return true, nil
-			}
-		}
-		log("matchLine", "debug", "No digit found")
-		return false, nil
+	// Fix escaping of backslashes
+	pattern = unescapePattern(pattern)
+	log("matchLine", "debug", fmt.Sprintf("Unescaped pattern: %q", pattern))
 
-	case `\w`:
-		log("matchLine", "debug", "Pattern is \\w — matching alphanumeric or underscore")
-		for _, b := range line {
-			if (b >= 'a' && b <= 'z') ||
-				(b >= 'A' && b <= 'Z') ||
-				(b >= '0' && b <= '9') ||
-				b == '_' {
-				log("matchLine", "debug", fmt.Sprintf("Found alphanumeric/underscore: %q", b))
-				return true, nil
-			}
-		}
-		log("matchLine", "debug", "No alphanumeric/underscore character found")
-		return false, nil
+	tokens, err := tokenizePattern(pattern)
+	if err != nil {
+		return false, err
 	}
+	log("matchLine", "debug", fmt.Sprintf("Tokenized into %d tokens", len(tokens)))
 
-	// Handle character groups like [abc] and [^abc]
-	if strings.HasPrefix(pattern, "[") && strings.HasSuffix(pattern, "]") {
-		log("matchLine", "debug", "Pattern is a character group")
-		if len(pattern) <= 2 {
-			return false, fmt.Errorf("empty character group: %q", pattern)
-		}
-
-		groupContent := pattern[1 : len(pattern)-1] // inside the brackets
-		isNegated := strings.HasPrefix(groupContent, "^")
-		if isNegated {
-			groupContent = groupContent[1:] // strip the ^
-			log("matchLine", "debug", fmt.Sprintf("Negated group, contents: %q", groupContent))
-		} else {
-			log("matchLine", "debug", fmt.Sprintf("Positive group, contents: %q", groupContent))
-		}
-
-		if isNegated {
-			for _, b := range line {
-				if !strings.ContainsRune(groupContent, rune(b)) {
-					log("matchLine", "debug", fmt.Sprintf("Found non-matching char: %q", b))
-					return true, nil
-				}
-			}
-			log("matchLine", "debug", "All chars were part of negated set")
-			return false, nil
-		} else {
-			ok := bytes.ContainsAny(line, groupContent)
-			log("matchLine", "debug", fmt.Sprintf("Group match result: %v", ok))
-			return ok, nil
-		}
-	}
-
-	// Default: literal character match (single rune)
-	if utf8.RuneCountInString(pattern) != 1 {
-		return false, fmt.Errorf("unsupported pattern: %q", pattern)
-	}
-
-	log("matchLine", "debug", fmt.Sprintf("Pattern is literal: %q", pattern))
-	ok := bytes.ContainsAny(line, pattern)
-	log("matchLine", "debug", fmt.Sprintf("Match result: %v", ok))
+	ok := matchTokens(line, tokens)
+	log("matchLine", "debug", fmt.Sprintf("Final match result: %v", ok))
 	return ok, nil
+}
+
+func unescapePattern(p string) string {
+	// Replace \\ with \
+	return strings.ReplaceAll(p, `\\`, `\`)
+}
+
+func tokenizePattern(pat string) ([]token, error) {
+	var tokens []token
+	i := 0
+	for i < len(pat) {
+		switch {
+		case pat[i] == '\\':
+			if i+1 >= len(pat) {
+				return nil, fmt.Errorf("dangling escape at end of pattern")
+			}
+			switch pat[i+1] {
+			case 'd':
+				tokens = append(tokens, token{"digit", ""})
+			case 'w':
+				tokens = append(tokens, token{"word", ""})
+			default:
+				return nil, fmt.Errorf("unsupported escape sequence: \\%c", pat[i+1])
+			}
+			i += 2
+
+		case pat[i] == '[':
+			j := i + 1
+			for j < len(pat) && pat[j] != ']' {
+				j++
+			}
+			if j >= len(pat) {
+				return nil, fmt.Errorf("unterminated character group")
+			}
+			group := pat[i+1 : j]
+			if strings.HasPrefix(group, "^") {
+				tokens = append(tokens, token{"negated_group", group[1:]})
+			} else {
+				tokens = append(tokens, token{"group", group})
+			}
+			i = j + 1
+
+		default:
+			r, size := utf8.DecodeRuneInString(pat[i:])
+			tokens = append(tokens, token{"literal", string(r)})
+			i += size
+		}
+	}
+	return tokens, nil
+}
+
+func matchTokens(input []byte, tokens []token) bool {
+	inputRunes := []rune(string(input))
+	for i := 0; i <= len(inputRunes)-len(tokens); i++ {
+		match := true
+		for j, tok := range tokens {
+			c := inputRunes[i+j]
+			switch tok.kind {
+			case "digit":
+				if c < '0' || c > '9' {
+					match = false
+				}
+			case "word":
+				if !(c >= 'a' && c <= 'z') &&
+					!(c >= 'A' && c <= 'Z') &&
+					!(c >= '0' && c <= '9') &&
+					c != '_' {
+					match = false
+				}
+			case "literal":
+				if string(c) != tok.value {
+					match = false
+				}
+			case "group":
+				if !strings.ContainsRune(tok.value, c) {
+					match = false
+				}
+			case "negated_group":
+				if strings.ContainsRune(tok.value, c) {
+					match = false
+				}
+			default:
+				match = false
+			}
+			if !match {
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 func log(funcName, level, message string) {
