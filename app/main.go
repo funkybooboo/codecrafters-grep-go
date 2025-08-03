@@ -104,6 +104,7 @@ func tokenizePattern(pat string) ([]token, error) {
 
 	for i < len(pat) {
 		var tok token
+		var hasToken bool
 
 		switch {
 		case pat[i] == '\\':
@@ -119,6 +120,7 @@ func tokenizePattern(pat string) ([]token, error) {
 				return nil, fmt.Errorf("unsupported escape sequence: \\%c", pat[i+1])
 			}
 			i += 2
+			hasToken = true
 
 		case pat[i] == '[':
 			j := i + 1
@@ -135,15 +137,21 @@ func tokenizePattern(pat string) ([]token, error) {
 				tok = token{"group", group, ""}
 			}
 			i = j + 1
+			hasToken = true
+
+		case pat[i] == '.':
+			tok = token{"any", "", ""}
+			i++
+			hasToken = true
 
 		default:
 			r, size := utf8.DecodeRuneInString(pat[i:])
 			tok = token{"literal", string(r), ""}
 			i += size
+			hasToken = true
 		}
 
-		// If the next char is a quantifier, attach it to this token
-		if i < len(pat) {
+		if hasToken && i < len(pat) {
 			switch pat[i] {
 			case '+', '?':
 				tok.quantifier = string(pat[i])
@@ -294,6 +302,8 @@ func tokenMatchesRune(tok token, c rune) bool {
 		return strings.ContainsRune(tok.value, c)
 	case "negated_group":
 		return !strings.ContainsRune(tok.value, c)
+	case "any":
+		return true // . matches any character
 	default:
 		return false
 	}
