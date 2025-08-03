@@ -60,7 +60,8 @@ func parseArgs(args []string) (string, error) {
 func matchLine(line []byte, pattern string) (bool, error) {
 	log("matchLine", "debug", fmt.Sprintf("Matching pattern: %q", pattern))
 
-	if pattern == `\d` {
+	switch pattern {
+	case `\d`:
 		log("matchLine", "debug", "Pattern is \\d — matching any digit")
 		for _, b := range line {
 			if b >= '0' && b <= '9' {
@@ -70,9 +71,23 @@ func matchLine(line []byte, pattern string) (bool, error) {
 		}
 		log("matchLine", "debug", "No digit found")
 		return false, nil
+
+	case `\w`:
+		log("matchLine", "debug", "Pattern is \\w — matching alphanumeric or underscore")
+		for _, b := range line {
+			if (b >= 'a' && b <= 'z') ||
+				(b >= 'A' && b <= 'Z') ||
+				(b >= '0' && b <= '9') ||
+				b == '_' {
+				log("matchLine", "debug", fmt.Sprintf("Found alphanumeric/underscore: %q", b))
+				return true, nil
+			}
+		}
+		log("matchLine", "debug", "No alphanumeric/underscore character found")
+		return false, nil
 	}
 
-	// Default: only allow a single character
+	// Default: only allow a single literal character
 	if utf8.RuneCountInString(pattern) != 1 {
 		return false, fmt.Errorf("unsupported pattern: %q", pattern)
 	}
