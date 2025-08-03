@@ -87,17 +87,36 @@ func matchLine(line []byte, pattern string) (bool, error) {
 		return false, nil
 	}
 
-	// Handle positive character group like [abc]
+	// Handle character groups like [abc] and [^abc]
 	if strings.HasPrefix(pattern, "[") && strings.HasSuffix(pattern, "]") {
 		log("matchLine", "debug", "Pattern is a character group")
 		if len(pattern) <= 2 {
 			return false, fmt.Errorf("empty character group: %q", pattern)
 		}
-		charGroup := pattern[1 : len(pattern)-1] // remove brackets
-		log("matchLine", "debug", fmt.Sprintf("Character group contents: %q", charGroup))
-		ok := bytes.ContainsAny(line, charGroup)
-		log("matchLine", "debug", fmt.Sprintf("Group match result: %v", ok))
-		return ok, nil
+
+		groupContent := pattern[1 : len(pattern)-1] // inside the brackets
+		isNegated := strings.HasPrefix(groupContent, "^")
+		if isNegated {
+			groupContent = groupContent[1:] // strip the ^
+			log("matchLine", "debug", fmt.Sprintf("Negated group, contents: %q", groupContent))
+		} else {
+			log("matchLine", "debug", fmt.Sprintf("Positive group, contents: %q", groupContent))
+		}
+
+		if isNegated {
+			for _, b := range line {
+				if !strings.ContainsRune(groupContent, rune(b)) {
+					log("matchLine", "debug", fmt.Sprintf("Found non-matching char: %q", b))
+					return true, nil
+				}
+			}
+			log("matchLine", "debug", "All chars were part of negated set")
+			return false, nil
+		} else {
+			ok := bytes.ContainsAny(line, groupContent)
+			log("matchLine", "debug", fmt.Sprintf("Group match result: %v", ok))
+			return ok, nil
+		}
 	}
 
 	// Default: literal character match (single rune)
