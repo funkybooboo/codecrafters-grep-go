@@ -18,8 +18,9 @@ var logLevels = map[string]int{
 }
 
 type token struct {
-	kind  string // "literal", "digit", "word", "group", "negated_group"
-	value string
+	kind       string // "literal", "digit", "word", "group", "negated_group"
+	value      string
+	quantifier string // "", "+" (for now)
 }
 
 func main() {
@@ -94,7 +95,6 @@ func matchLine(line []byte, pattern string) (bool, error) {
 }
 
 func unescapePattern(p string) string {
-	// Replace \\ with \
 	return strings.ReplaceAll(p, `\\`, `\`)
 }
 
@@ -102,6 +102,8 @@ func tokenizePattern(pat string) ([]token, error) {
 	var tokens []token
 	i := 0
 	for i < len(pat) {
+		var tok token
+
 		switch {
 		case pat[i] == '\\':
 			if i+1 >= len(pat) {
@@ -109,9 +111,9 @@ func tokenizePattern(pat string) ([]token, error) {
 			}
 			switch pat[i+1] {
 			case 'd':
-				tokens = append(tokens, token{"digit", ""})
+				tok = token{"digit", "", ""}
 			case 'w':
-				tokens = append(tokens, token{"word", ""})
+				tok = token{"word", "", ""}
 			default:
 				return nil, fmt.Errorf("unsupported escape sequence: \\%c", pat[i+1])
 			}
@@ -127,85 +129,151 @@ func tokenizePattern(pat string) ([]token, error) {
 			}
 			group := pat[i+1 : j]
 			if strings.HasPrefix(group, "^") {
-				tokens = append(tokens, token{"negated_group", group[1:]})
+				tok = token{"negated_group", group[1:], ""}
 			} else {
-				tokens = append(tokens, token{"group", group})
+				tok = token{"group", group, ""}
 			}
 			i = j + 1
 
 		default:
 			r, size := utf8.DecodeRuneInString(pat[i:])
-			tokens = append(tokens, token{"literal", string(r)})
+			tok = token{"literal", string(r), ""}
 			i += size
 		}
+
+		if i < len(pat) && pat[i] == '+' {
+			tok.quantifier = "+"
+			i++
+		}
+
+		tokens = append(tokens, tok)
 	}
 	return tokens, nil
 }
 
 func matchTokens(input []byte, tokens []token, anchoredStart, anchoredEnd bool) bool {
 	inputRunes := []rune(string(input))
-	maxStart := len(inputRunes) - len(tokens)
-	if maxStart < 0 {
-		return false
-	}
+	startPositions := []int{0}
 
-	startIndexes := []int{0}
 	if !anchoredStart {
-		startIndexes = make([]int, maxStart+1)
-		for i := range startIndexes {
-			startIndexes[i] = i
+		startPositions = make([]int, len(inputRunes)+1)
+		for i := range startPositions {
+			startPositions[i] = i
 		}
 	}
 
-	for _, i := range startIndexes {
-		if i+len(tokens) > len(inputRunes) {
-			continue
-		}
-
-		if anchoredEnd && i+len(tokens) != len(inputRunes) {
-			continue
-		}
-
+	for _, start := range startPositions {
+		pos := start
+		tokIdx := 0
 		match := true
-		for j, tok := range tokens {
-			c := inputRunes[i+j]
-			switch tok.kind {
-			case "digit":
-				if c < '0' || c > '9' {
-					match = false
+
+		for tokIdx < len(tokens) {
+			tok := tokens[tokIdx]
+			startPos := pos
+			count := 0
+
+			for pos < len(inputRunes) && tokenMatchesRune(tok, inputRunes[pos]) {
+				count++
+				pos++
+				if tok.quantifier != "+" {
+					break
 				}
-			case "word":
-				if !(c >= 'a' && c <= 'z') &&
-					!(c >= 'A' && c <= 'Z') &&
-					!(c >= '0' && c <= '9') &&
-					c != '_' {
-					match = false
-				}
-			case "literal":
-				if string(c) != tok.value {
-					match = false
-				}
-			case "group":
-				if !strings.ContainsRune(tok.value, c) {
-					match = false
-				}
-			case "negated_group":
-				if strings.ContainsRune(tok.value, c) {
-					match = false
-				}
-			default:
-				match = false
 			}
-			if !match {
+
+			if tok.quantifier == "+" && count == 0 {
+				match = false
 				break
 			}
+			if tok.quantifier == "" && count != 1 {
+				match = false
+				break
+			}
+
+			if tok.quantifier == "+" && tokIdx+1 < len(tokens) {
+				for back := pos; back > startPos; back-- {
+					if matchTokensFrom(inputRunes, back, tokens[tokIdx+1:], anchoredEnd) {
+						return true
+					}
+				}
+				match = false
+				break
+			}
+
+			tokIdx++
 		}
 
 		if match {
+			if anchoredEnd && pos != len(inputRunes) {
+				continue
+			}
 			return true
 		}
 	}
 	return false
+}
+
+func matchTokensFrom(inputRunes []rune, pos int, tokens []token, anchoredEnd bool) bool {
+	tokIdx := 0
+	for tokIdx < len(tokens) {
+		if pos >= len(inputRunes) {
+			return false
+		}
+
+		tok := tokens[tokIdx]
+		startPos := pos
+		count := 0
+
+		for pos < len(inputRunes) && tokenMatchesRune(tok, inputRunes[pos]) {
+			count++
+			pos++
+			if tok.quantifier != "+" {
+				break
+			}
+		}
+
+		if tok.quantifier == "+" && count == 0 {
+			return false
+		}
+		if tok.quantifier == "" && count != 1 {
+			return false
+		}
+
+		if tok.quantifier == "+" && tokIdx+1 < len(tokens) {
+			for back := pos; back > startPos; back-- {
+				if matchTokensFrom(inputRunes, back, tokens[tokIdx+1:], anchoredEnd) {
+					return true
+				}
+			}
+			return false
+		}
+
+		tokIdx++
+	}
+
+	if anchoredEnd {
+		return pos == len(inputRunes)
+	}
+	return true
+}
+
+func tokenMatchesRune(tok token, c rune) bool {
+	switch tok.kind {
+	case "digit":
+		return c >= '0' && c <= '9'
+	case "word":
+		return (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '_'
+	case "literal":
+		return string(c) == tok.value
+	case "group":
+		return strings.ContainsRune(tok.value, c)
+	case "negated_group":
+		return !strings.ContainsRune(tok.value, c)
+	default:
+		return false
+	}
 }
 
 func log(funcName, level, message string) {
