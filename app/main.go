@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -20,27 +21,50 @@ var logLevels = map[string]int{
 func main() {
 	log("main", "debug", "Starting program...")
 
-	// Parse the -E pattern
-	pattern, err := parseArgs(os.Args)
+	// Parse flags, pattern, and paths
+	recursive, pattern, paths, err := parseArgs(os.Args)
 	if err != nil {
 		log("main", "error", fmt.Sprintf("Argument parsing failed: %v", err))
 		os.Exit(2)
 	}
 
-	// Determine file list (args[3:] if any)
-	files := os.Args[3:]
-	multi := len(files) > 1
-
 	foundAny := false
+	multi := recursive || len(paths) > 1
 
-	// If no files given, read from stdin without prefix
-	if len(files) == 0 {
-		if scanAndPrint("<stdin>", os.Stdin, pattern, false) {
+	if len(paths) == 0 {
+		// No paths: read stdin
+		if scanAndPrint("stdin", os.Stdin, pattern, false) {
 			foundAny = true
 		}
+	} else if recursive {
+		// Recursive: walk each root
+		for _, root := range paths {
+			err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					// Can't read this path: skip
+					return nil
+				}
+				if info.IsDir() {
+					return nil
+				}
+				f, err := os.Open(path)
+				if err != nil {
+					return nil
+				}
+				defer f.Close()
+				if scanAndPrint(path, f, pattern, true) {
+					foundAny = true
+				}
+				return nil
+			})
+			if err != nil {
+				log("main", "error", fmt.Sprintf("Error walking %s: %v", root, err))
+				os.Exit(2)
+			}
+		}
 	} else {
-		// Iterate each file
-		for _, filename := range files {
+		// Non-recursive, specific files
+		for _, filename := range paths {
 			f, err := os.Open(filename)
 			if err != nil {
 				log("main", "error", fmt.Sprintf("Failed to open file %q: %v", filename, err))
@@ -53,14 +77,33 @@ func main() {
 		}
 	}
 
-	// Exit 0 if any matches, else 1
 	if foundAny {
 		os.Exit(0)
 	}
 	os.Exit(1)
 }
 
-// scanAndPrint reads from reader line by line, applies the pattern,
+// parseArgs handles [-r] -E <pattern> [paths...]
+func parseArgs(args []string) (recursive bool, pattern string, paths []string, err error) {
+	i := 1
+	if i < len(args) && args[i] == "-r" {
+		recursive = true
+		i++
+	}
+	if i >= len(args) || args[i] != "-E" {
+		return false, "", nil, fmt.Errorf("usage: mygrep [-r] -E <pattern> [paths...]")
+	}
+	i++
+	if i >= len(args) {
+		return false, "", nil, fmt.Errorf("usage: mygrep [-r] -E <pattern> [paths...]")
+	}
+	pattern = args[i]
+	i++
+	paths = args[i:]
+	return
+}
+
+// scanAndPrint reads from reader line by line, applies pattern,
 // prints matching lines (with optional filename prefix), and
 // returns true if any lines matched.
 func scanAndPrint(prefix string, reader io.Reader, pattern string, addPrefix bool) bool {
@@ -90,16 +133,6 @@ func scanAndPrint(prefix string, reader io.Reader, pattern string, addPrefix boo
 	return found
 }
 
-// parseArgs validates and returns the -E pattern.
-func parseArgs(args []string) (string, error) {
-	log("parseArgs", "debug", "Parsing arguments...")
-	if len(args) < 3 || args[1] != "-E" {
-		return "", fmt.Errorf("usage: mygrep -E <pattern> [file1 file2 ...]")
-	}
-	log("parseArgs", "debug", fmt.Sprintf("Pattern received: %q", args[2]))
-	return args[2], nil
-}
-
 // unescapePattern turns literal "\\d", "\\w", "\\1", etc. into "\d", "\w", "\1".
 func unescapePattern(p string) string {
 	return strings.ReplaceAll(p, `\\`, `\`)
@@ -113,7 +146,6 @@ func matchLine(input []byte, pattern string) (bool, error) {
 	pattern = unescapePattern(pattern)
 	log("matchLine", "debug", fmt.Sprintf("Unescaped pattern: %q", pattern))
 
-	// handle anchors
 	anchoredStart := false
 	anchoredEnd := false
 	if strings.HasPrefix(pattern, "^") {
@@ -127,7 +159,6 @@ func matchLine(input []byte, pattern string) (bool, error) {
 		log("matchLine", "debug", "Detected end anchor $")
 	}
 
-	// parse into AST (with nested capture numbering)
 	p := newParser(pattern)
 	root, err := p.parse()
 	if err != nil {
@@ -137,7 +168,6 @@ func matchLine(input []byte, pattern string) (bool, error) {
 		return false, fmt.Errorf("unexpected character at position %d", p.pos)
 	}
 
-	// convert input to runes
 	runes := []rune(string(input))
 	emptyCaps := make(map[int][]rune)
 
@@ -293,7 +323,6 @@ func (p *parser) parseAtom() (node, error) {
 			return nil, fmt.Errorf("dangling escape")
 		}
 		esc := p.pattern[p.pos]
-		// backrefs may be multiple digits
 		if esc >= '1' && esc <= '9' {
 			num := 0
 			for p.pos < len(p.pattern) && p.pattern[p.pos] >= '0' && p.pattern[p.pos] <= '9' {
